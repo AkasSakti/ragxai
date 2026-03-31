@@ -4,37 +4,22 @@ import os
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable
 
 import streamlit as st
 from langchain_community.document_loaders import WebBaseLoader
 from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import PromptTemplate
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 
 PROJECT_ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_INDEX_DIR = PROJECT_ROOT_DIR / "model" / "faiss_index"
 FAISS_INDEX_DIR = Path(os.getenv("FAISS_INDEX_DIR", str(DEFAULT_INDEX_DIR)))
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-GENERATION_MODEL = os.getenv("GENERATION_MODEL", "google/flan-t5-small")
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
 TOP_K = 3
 SIMILARITY_THRESHOLD = 0.35
-
-PROMPT_TEMPLATE = """Anda adalah chatbot RAG.
-Jawab pertanyaan hanya berdasarkan konteks.
-Jika konteks tidak cukup, jawab persis: Data tidak ditemukan dalam dokumen
-
-Konteks:
-{context}
-
-Pertanyaan: {question}
-Jawaban:
-"""
 
 
 @st.cache_resource(show_spinner=False)
@@ -56,29 +41,6 @@ def get_vectorstore():
         get_embeddings(),
         allow_dangerous_deserialization=True,
     )
-
-
-@st.cache_resource(show_spinner=False)
-def get_generator_components():
-    tokenizer = AutoTokenizer.from_pretrained(GENERATION_MODEL)
-    model = AutoModelForSeq2SeqLM.from_pretrained(GENERATION_MODEL)
-    return tokenizer, model
-
-
-def run_generation(prompt: str) -> str:
-    tokenizer, model = get_generator_components()
-    inputs = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=1024,
-    )
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=256,
-        do_sample=False,
-    )
-    return tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
 
 
 @lru_cache(maxsize=8)
@@ -160,18 +122,6 @@ def has_keyword_overlap(question: str, results) -> bool:
     return False
 
 
-def build_context(results: Iterable[dict]) -> str:
-    context_blocks = []
-    for index, item in enumerate(results, start=1):
-        source = item["source"]
-        score = item["similarity"]
-        content = item["document"].page_content.strip()
-        context_blocks.append(
-            f"[Dokumen {index}] sumber={source} | similarity={score:.4f}\n{content}"
-        )
-    return "\n\n".join(context_blocks)
-
-
 def generate_answer(question: str, results):
     if not results:
         return "Data tidak ditemukan dalam dokumen"
@@ -180,17 +130,8 @@ def generate_answer(question: str, results):
     if best_similarity < SIMILARITY_THRESHOLD and not has_keyword_overlap(question, results):
         return "Data tidak ditemukan dalam dokumen"
 
-    context = build_context(results)
-    prompt = PromptTemplate.from_template(PROMPT_TEMPLATE).format(
-        context=context,
-        question=question,
-    )
-    response = run_generation(prompt)
-    if response and response != "Data tidak ditemukan dalam dokumen":
-        return response
-
-    # Fallback extractive answer when the generator is too conservative.
-    return results[0]["document"].page_content.strip()[:500] or "Data tidak ditemukan dalam dokumen"
+    # Extractive answer: return the most relevant chunk directly.
+    return results[0]["document"].page_content.strip()[:700] or "Data tidak ditemukan dalam dokumen"
 
 
 def render_sources(results):
