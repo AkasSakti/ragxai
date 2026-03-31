@@ -122,6 +122,54 @@ def has_keyword_overlap(question: str, results) -> bool:
     return False
 
 
+def clean_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def split_sentences(text: str) -> list[str]:
+    normalized = clean_text(text)
+    parts = re.split(r"(?<=[.!?])\s+|\n+", normalized)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def extract_title_from_source(source: str) -> str:
+    if source.lower().endswith(".pdf"):
+        source = source[:-4]
+    return clean_text(source.replace("-", " ").replace("_", " "))
+
+
+def rank_sentences(question: str, content: str) -> list[str]:
+    question_tokens = tokenize(question)
+    scored = []
+    for sentence in split_sentences(content):
+        sentence_tokens = tokenize(sentence)
+        overlap = len(question_tokens & sentence_tokens)
+        bonus = 0.2 if len(sentence) <= 260 else 0.0
+        score = overlap + bonus
+        if score > 0:
+            scored.append((score, sentence))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [sentence for _, sentence in scored]
+
+
+def build_narrative_answer(question: str, best_result: dict) -> str:
+    source = best_result["source"]
+    title = extract_title_from_source(source)
+    content = clean_text(best_result["document"].page_content)
+    ranked_sentences = rank_sentences(question, content)
+
+    if ranked_sentences:
+        main_sentence = ranked_sentences[0]
+        return f"Berdasarkan artikel \"{title}\", {main_sentence}"
+
+    snippet = content[:400]
+    if snippet:
+        return f"Berdasarkan artikel \"{title}\", informasi yang paling relevan adalah: {snippet}"
+
+    return "Data tidak ditemukan dalam dokumen"
+
+
 def generate_answer(question: str, results):
     if not results:
         return "Data tidak ditemukan dalam dokumen"
@@ -130,8 +178,7 @@ def generate_answer(question: str, results):
     if best_similarity < SIMILARITY_THRESHOLD and not has_keyword_overlap(question, results):
         return "Data tidak ditemukan dalam dokumen"
 
-    # Extractive answer: return the most relevant chunk directly.
-    return results[0]["document"].page_content.strip()[:700] or "Data tidak ditemukan dalam dokumen"
+    return build_narrative_answer(question, results[0])
 
 
 def render_sources(results):
