@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
@@ -23,7 +24,7 @@ GENERATION_MODEL = os.getenv("GENERATION_MODEL", "google/flan-t5-small")
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
 TOP_K = 3
-SIMILARITY_THRESHOLD = 0.75
+SIMILARITY_THRESHOLD = 0.35
 
 PROMPT_TEMPLATE = """Anda adalah chatbot RAG.
 Jawab pertanyaan hanya berdasarkan konteks.
@@ -135,6 +136,22 @@ def combine_results(pdf_results, url_results):
     return combined[:TOP_K]
 
 
+def tokenize(text: str) -> set[str]:
+    return {token for token in re.findall(r"\w+", text.lower()) if len(token) >= 3}
+
+
+def has_keyword_overlap(question: str, results) -> bool:
+    question_tokens = tokenize(question)
+    if not question_tokens:
+        return False
+
+    for item in results:
+        content_tokens = tokenize(item["document"].page_content)
+        if question_tokens & content_tokens:
+            return True
+    return False
+
+
 def build_context(results: Iterable[dict]) -> str:
     context_blocks = []
     for index, item in enumerate(results, start=1):
@@ -152,7 +169,7 @@ def generate_answer(question: str, results):
         return "Data tidak ditemukan dalam dokumen"
 
     best_similarity = results[0]["similarity"]
-    if best_similarity < SIMILARITY_THRESHOLD:
+    if best_similarity < SIMILARITY_THRESHOLD and not has_keyword_overlap(question, results):
         return "Data tidak ditemukan dalam dokumen"
 
     context = build_context(results)
@@ -161,7 +178,11 @@ def generate_answer(question: str, results):
         question=question,
     )
     response = get_llm().invoke(prompt).strip()
-    return response or "Data tidak ditemukan dalam dokumen"
+    if response and response != "Data tidak ditemukan dalam dokumen":
+        return response
+
+    # Fallback extractive answer when the generator is too conservative.
+    return results[0]["document"].page_content.strip()[:500] or "Data tidak ditemukan dalam dokumen"
 
 
 def render_sources(results):
@@ -198,7 +219,11 @@ def main():
         st.subheader("Jawaban")
         st.write(answer)
 
-        if answer != "Data tidak ditemukan dalam dokumen" and final_results:
+        if final_results:
+            st.caption(
+                f"Best similarity: {final_results[0]['similarity']:.4f} | "
+                f"Threshold: {SIMILARITY_THRESHOLD:.2f}"
+            )
             render_sources(final_results)
 
 
