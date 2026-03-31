@@ -192,7 +192,7 @@ def render_sources(results):
 def main():
     st.set_page_config(page_title="Simple R49XAi 4 PDF Chatbot", layout="wide")
     st.title("Simple R49XAi 4 PDF Chatbot")
-    st.write("Workflow utama: bangun knowledge base di Colab, deploy artefak model ke GitHub dan Streamlit.")
+    st.write("Powered By. AkasSakti")
     
     question = st.text_input("Masukkan pertanyaan")
     url = st.text_input("Masukkan URL opsional")
