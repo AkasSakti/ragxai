@@ -1,0 +1,206 @@
+from __future__ import annotations
+
+import os
+from functools import lru_cache
+from pathlib import Path
+from typing import Iterable
+
+import streamlit as st
+from langchain_community.document_loaders import WebBaseLoader
+from langchain_community.llms import HuggingFacePipeline
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import PromptTemplate
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
+
+
+PROJECT_ROOT_DIR = Path(__file__).resolve().parent
+DEFAULT_INDEX_DIR = PROJECT_ROOT_DIR / "model" / "faiss_index"
+FAISS_INDEX_DIR = Path(os.getenv("FAISS_INDEX_DIR", str(DEFAULT_INDEX_DIR)))
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+GENERATION_MODEL = os.getenv("GENERATION_MODEL", "google/flan-t5-small")
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 50
+TOP_K = 3
+SIMILARITY_THRESHOLD = 0.75
+
+PROMPT_TEMPLATE = """Anda adalah chatbot RAG.
+Jawab pertanyaan hanya berdasarkan konteks.
+Jika konteks tidak cukup, jawab persis: Data tidak ditemukan dalam dokumen
+
+Konteks:
+{context}
+
+Pertanyaan: {question}
+Jawaban:
+"""
+
+
+@st.cache_resource(show_spinner=False)
+def get_embeddings():
+    return HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL,
+        encode_kwargs={"normalize_embeddings": True},
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def get_vectorstore():
+    if not FAISS_INDEX_DIR.exists():
+        raise FileNotFoundError(
+            f"Folder index tidak ditemukan: {FAISS_INDEX_DIR}. Jalankan build_faiss.py dulu."
+        )
+    return FAISS.load_local(
+        str(FAISS_INDEX_DIR),
+        get_embeddings(),
+        allow_dangerous_deserialization=True,
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def get_llm():
+    tokenizer = AutoTokenizer.from_pretrained(GENERATION_MODEL)
+    model = AutoModelForSeq2SeqLM.from_pretrained(GENERATION_MODEL)
+    text2text = pipeline(
+        "text2text-generation",
+        model=model,
+        tokenizer=tokenizer,
+        max_new_tokens=256,
+        do_sample=False,
+    )
+    return HuggingFacePipeline(pipeline=text2text)
+
+
+@lru_cache(maxsize=8)
+def load_url_documents(url: str):
+    loader = WebBaseLoader(url)
+    documents = loader.load()
+
+    for document in documents:
+        document.metadata["source"] = url
+        document.metadata["source_type"] = "url"
+        document.metadata["display_source"] = url
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+    )
+    return splitter.split_documents(documents)
+
+
+def normalize_score(raw_score: float) -> float:
+    """
+    Convert FAISS squared L2 distance to a 0..1 cosine-like similarity.
+    This works because embeddings are normalized before being indexed.
+    """
+    similarity = 1.0 - (float(raw_score) / 2.0)
+    return max(0.0, min(1.0, similarity))
+
+
+def search_documents(vectorstore, query: str):
+    results = vectorstore.similarity_search_with_score(query, k=TOP_K)
+    return [
+        {
+            "document": document,
+            "similarity": normalize_score(score),
+            "source": document.metadata.get("display_source")
+            or document.metadata.get("source")
+            or "Sumber tidak diketahui",
+        }
+        for document, score in results
+    ]
+
+
+def search_url_documents(query: str, url: str):
+    documents = load_url_documents(url)
+    if not documents:
+        return []
+
+    temp_vectorstore = FAISS.from_documents(documents, get_embeddings())
+    results = temp_vectorstore.similarity_search_with_score(query, k=TOP_K)
+    return [
+        {
+            "document": document,
+            "similarity": normalize_score(score),
+            "source": document.metadata.get("display_source", url),
+        }
+        for document, score in results
+    ]
+
+
+def combine_results(pdf_results, url_results):
+    combined = pdf_results + url_results
+    combined.sort(key=lambda item: item["similarity"], reverse=True)
+    return combined[:TOP_K]
+
+
+def build_context(results: Iterable[dict]) -> str:
+    context_blocks = []
+    for index, item in enumerate(results, start=1):
+        source = item["source"]
+        score = item["similarity"]
+        content = item["document"].page_content.strip()
+        context_blocks.append(
+            f"[Dokumen {index}] sumber={source} | similarity={score:.4f}\n{content}"
+        )
+    return "\n\n".join(context_blocks)
+
+
+def generate_answer(question: str, results):
+    if not results:
+        return "Data tidak ditemukan dalam dokumen"
+
+    best_similarity = results[0]["similarity"]
+    if best_similarity < SIMILARITY_THRESHOLD:
+        return "Data tidak ditemukan dalam dokumen"
+
+    context = build_context(results)
+    prompt = PromptTemplate.from_template(PROMPT_TEMPLATE).format(
+        context=context,
+        question=question,
+    )
+    response = get_llm().invoke(prompt).strip()
+    return response or "Data tidak ditemukan dalam dokumen"
+
+
+def render_sources(results):
+    st.subheader("Explainability")
+    for item in results:
+        st.write(f"Sumber: {item['source']}")
+        st.write(f"Similarity score: {item['similarity']:.4f}")
+        st.caption(item["document"].page_content[:300] + "...")
+
+
+def main():
+    st.set_page_config(page_title="Simple RAG PDF Chatbot", layout="wide")
+    st.title("Simple RAG PDF Chatbot")
+    st.write("Workflow utama: bangun knowledge base di Colab, lalu deploy artefak model ke GitHub dan Streamlit.")
+    st.caption(f"Index aktif: {FAISS_INDEX_DIR}")
+
+    question = st.text_input("Masukkan pertanyaan")
+    url = st.text_input("Masukkan URL opsional")
+
+    if st.button("Kirim", type="primary"):
+        if not question.strip():
+            st.warning("Pertanyaan wajib diisi.")
+            return
+
+        try:
+            pdf_results = search_documents(get_vectorstore(), question)
+            url_results = search_url_documents(question, url) if url.strip() else []
+            final_results = combine_results(pdf_results, url_results)
+            answer = generate_answer(question, final_results)
+        except Exception as exc:
+            st.error(f"Terjadi error: {exc}")
+            return
+
+        st.subheader("Jawaban")
+        st.write(answer)
+
+        if answer != "Data tidak ditemukan dalam dokumen" and final_results:
+            render_sources(final_results)
+
+
+if __name__ == "__main__":
+    main()
