@@ -8,12 +8,11 @@ from typing import Iterable
 
 import streamlit as st
 from langchain_community.document_loaders import WebBaseLoader
-from langchain_community.llms import HuggingFacePipeline
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 
 PROJECT_ROOT_DIR = Path(__file__).resolve().parent
@@ -60,17 +59,26 @@ def get_vectorstore():
 
 
 @st.cache_resource(show_spinner=False)
-def get_llm():
+def get_generator_components():
     tokenizer = AutoTokenizer.from_pretrained(GENERATION_MODEL)
     model = AutoModelForSeq2SeqLM.from_pretrained(GENERATION_MODEL)
-    text2text = pipeline(
-        "text2text-generation",
-        model=model,
-        tokenizer=tokenizer,
+    return tokenizer, model
+
+
+def run_generation(prompt: str) -> str:
+    tokenizer, model = get_generator_components()
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=1024,
+    )
+    outputs = model.generate(
+        **inputs,
         max_new_tokens=256,
         do_sample=False,
     )
-    return HuggingFacePipeline(pipeline=text2text)
+    return tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
 
 
 @lru_cache(maxsize=8)
@@ -177,7 +185,7 @@ def generate_answer(question: str, results):
         context=context,
         question=question,
     )
-    response = get_llm().invoke(prompt).strip()
+    response = run_generation(prompt)
     if response and response != "Data tidak ditemukan dalam dokumen":
         return response
 
